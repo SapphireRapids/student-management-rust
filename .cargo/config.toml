@@ -1,0 +1,4 @@
+# 静态链接 C 运行时：产出的 sms.exe 不依赖 VC++ 运行库，
+# 与旧版 C++ /MT 静态链接一样，拷到没装 VS 的电脑上可直接运行。
+[build]
+rustflags = ["-C", "target-feature=+crt-static"]

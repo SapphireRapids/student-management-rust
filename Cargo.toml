@@ -1,0 +1,13 @@
+[package]
+name = "sms"
+version = "1.4.0"
+edition = "2021"
+description = "学生管理系统 Rust 重构版（控制台菜单 + 内置 HTTP 服务，网页前端共用同一份数据）"
+
+[[bin]]
+name = "sms"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+strip = true
