@@ -13,10 +13,11 @@ pub struct Student {
     pub total: i32,
 }
 
-/// 学号/姓名合法性：非空、限长、不能含逗号/制表符/控制字符（数据文件按逗号分隔）。
+/// 学号/姓名合法性：非空、限长（按字符数，与界面上"最多 N 个字符"的提示一致）、
+/// 不能含逗号/制表符/控制字符（数据文件按逗号分隔）。
 pub fn valid_field(s: &str) -> bool {
     !s.is_empty()
-        && s.len() <= 40
+        && s.chars().count() <= 40
         && !s.chars().any(|c| c == ',' || c == '\t' || (c as u32) < 0x20)
 }
 
@@ -38,8 +39,15 @@ impl Store {
             students: Vec::new(),
             data_file: data_file.to_path_buf(),
         };
+        // 上次被强杀在写一半时可能留下的 .tmp：它从不被读取，启动时清掉，
+        // 否则会一直躺在数据文件旁边（下次保存会原地复写，但没必要留着）
+        let _ = fs::remove_file(data_file.with_extension("txt.tmp"));
         let mut legacy = false;
-        if let Ok(text) = fs::read_to_string(data_file) {
+        // 按原始字节读入再宽松转码：个别非法 UTF-8 字节只让对应字符变成 U+FFFD。
+        // 旧版用 std::getline 读原始字节，行为一致；若改用 read_to_string，
+        // 一个坏字节就会让整份文件读不出来，之后第一次保存直接把全部数据覆盖丢失。
+        if let Ok(bytes) = fs::read(data_file) {
+            let text = String::from_utf8_lossy(&bytes);
             for line in text.lines() {
                 if line.is_empty() {
                     continue;
@@ -175,5 +183,85 @@ pub fn pad(s: &str, width: usize) -> String {
         s.to_string()
     } else {
         format!("{}{}", s, " ".repeat(width - d))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("sms_store_{}_{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d.join("students.txt")
+    }
+
+    #[test]
+    fn valid_field_counts_chars_not_bytes() {
+        // 40 个汉字 = 120 字节：按字符算必须放行（否则中文姓名会被误判"非法字符"）
+        assert!(valid_field(&"学".repeat(40)));
+        assert!(!valid_field(&"学".repeat(41)));
+        assert!(valid_field(&"a".repeat(40)));
+        assert!(!valid_field(&"a".repeat(41)));
+        assert!(!valid_field(""));
+        assert!(!valid_field("a,b"));
+        assert!(!valid_field("a\tb"));
+        assert!(!valid_field("a\u{1}b"));
+    }
+
+    #[test]
+    fn load_keeps_records_when_file_has_invalid_utf8() {
+        // 一个坏字节不该让整份数据读成空文件（那之后第一次保存会把数据全覆盖丢失）
+        let f = tmp("bad_utf8");
+        let mut bytes = b"S1,\xff\xfe,10\nS2,\xE6\x9D\x8E\xE5\x9B\x9B,20\n".to_vec();
+        bytes.extend_from_slice(b"S3,\xE7\x8E\x8B\xE4\xBA\x94,30\n");
+        fs::write(&f, &bytes).unwrap();
+        let st = Store::load(&f);
+        assert_eq!(st.students.len(), 3);
+        assert_eq!(st.students[0].stuno, "S1");
+        assert_eq!(st.students[0].name.matches('\u{FFFD}').count(), 2); // 两个坏字节各变一个
+        assert_eq!(st.students[1].name, "李四"); // 其余记录完好无损
+        assert_eq!(st.students[1].total, 20);
+        let _ = fs::remove_file(&f);
+    }
+
+    #[test]
+    fn load_parses_new_and_legacy_formats() {
+        let f = tmp("legacy");
+        fs::write(&f, "S1,张三,10\nS2,李四,80,90,100\n坏行\nS3,,30\n").unwrap();
+        let st = Store::load(&f);
+        assert_eq!(st.students.len(), 2); // 姓名为空的坏行被过滤
+        assert_eq!(st.students[0].total, 10);
+        assert_eq!(st.students[1].total, 270); // 80+90+100
+        let _ = fs::remove_file(&f);
+    }
+
+    #[test]
+    fn load_removes_stale_tmp_left_by_a_kill() {
+        let f = tmp("stale_tmp");
+        fs::write(&f, "S1,张三,10\n").unwrap();
+        let tmpf = f.with_extension("txt.tmp");
+        fs::write(&tmpf, "半截数据").unwrap();
+        assert!(tmpf.exists());
+        let st = Store::load(&f);
+        assert_eq!(st.students.len(), 1);
+        assert!(!tmpf.exists(), "启动时应清掉上次强杀残留的 .tmp");
+        let _ = fs::remove_file(&f);
+    }
+
+    #[test]
+    fn save_replaces_file_and_leaves_no_tmp() {
+        let f = tmp("save");
+        let mut st = Store::load(&f);
+        st.students.push(Student { stuno: "S1".into(), name: "张三".into(), total: 7 });
+        st.save();
+        st.students.push(Student { stuno: "S2".into(), name: "李四".into(), total: 8 });
+        st.save();
+        let back = Store::load(&f);
+        assert_eq!(back.students.len(), 2);
+        assert_eq!(back.students[1].total, 8);
+        assert!(!f.with_extension("txt.tmp").exists());
+        let _ = fs::remove_file(&f);
     }
 }

@@ -72,7 +72,7 @@ fn unescape(raw: &[u8]) -> String {
                 i += 4;
                 // 代理对：高代理 + \u 低代理 → 合成一个码位
                 if (0xD800..=0xDBFF).contains(&cp)
-                    && i + 6 < raw.len()
+                    && i + 6 <= raw.len()
                     && raw[i] == b'\\'
                     && raw[i + 1] == b'u'
                 {
@@ -100,14 +100,20 @@ fn unescape(raw: &[u8]) -> String {
 }
 
 /// 在扁平 JSON 对象中按键取值；字符串返回 Value::Str，数字返回 Value::Num。
-/// 找不到键、结构不符（如键名前不是 `{`/`,`/空格）时返回 None。
+/// 找不到键、结构不符（如键名前不是 `{`/`,`/空白）时返回 None。
 pub fn get(body: &str, key: &str) -> Option<Value> {
     let b = body.as_bytes();
     let pat = format!("\"{}\"", key);
-    let mut p = find(b, pat.as_bytes())?;
-    if p > 0 && b[p - 1] != b'{' && b[p - 1] != b',' && b[p - 1] != b' ' {
-        return None;
-    }
+    // 只有紧跟 { / , / 空白的才算对象键；出现在字符串值里的同名文本要跳过继续找
+    // （旧版遇到第一个就下结论，`{"name":"\"stuno\":x","stuno":"REAL"}` 会取不到真值）
+    let mut from = 0;
+    let mut p = loop {
+        let cand = from + find(&b[from..], pat.as_bytes())?;
+        if cand == 0 || matches!(b[cand - 1], b'{' | b',') || is_space(b[cand - 1]) {
+            break cand;
+        }
+        from = cand + 1;
+    };
     p += pat.len();
     while p < b.len() && is_space(b[p]) {
         p += 1;
@@ -181,4 +187,68 @@ pub fn escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_skips_key_lookalike_inside_string_value() {
+        // "stuno" 作为字符串值里的文本先出现，真正的键在后面：必须取到后面的真值
+        let body = r#"{"name":"\"stuno\":\"x\"","stuno":"REAL","total":88}"#;
+        assert!(matches!(get(body, "stuno"), Some(Value::Str(ref s)) if s == "REAL"));
+        assert!(matches!(get(body, "total"), Some(Value::Num(n)) if n == 88.0));
+        assert!(matches!(get(body, "name"), Some(Value::Str(ref s)) if s == "\"stuno\":\"x\""));
+    }
+
+    #[test]
+    fn get_returns_none_when_key_only_appears_in_a_value() {
+        assert!(get(r#"{"name":"\"stuno\":\"x\""}"#, "stuno").is_none());
+    }
+
+    #[test]
+    fn get_accepts_key_preceded_by_any_whitespace() {
+        let body = "{\n\t\"stuno\" : \"A1\"\r\n}";
+        assert!(matches!(get(body, "stuno"), Some(Value::Str(ref s)) if s == "A1"));
+    }
+
+    #[test]
+    fn unescape_merges_trailing_surrogate_pair() {
+        // 😀 = \uD83D\uDE00，低代理正好贴在字符串末尾（旧版因此不合并，变成两个 U+FFFD）
+        let body = "{\"name\":\"\\uD83D\\uDE00\"}";
+        assert!(matches!(get(body, "name"), Some(Value::Str(ref s)) if s == "😀"));
+    }
+
+    #[test]
+    fn unescape_merges_surrogate_pair_mid_string() {
+        let body = "{\"name\":\"a\\uD83D\\uDE00b\"}";
+        assert!(matches!(get(body, "name"), Some(Value::Str(ref s)) if s == "a😀b"));
+    }
+
+    #[test]
+    fn unescape_lone_surrogate_becomes_replacement() {
+        let body = "{\"name\":\"\\uD83D\"}";
+        assert!(matches!(get(body, "name"), Some(Value::Str(ref s)) if s == "\u{FFFD}"));
+    }
+
+    #[test]
+    fn unescape_basic_escapes_and_roundtrip() {
+        let body = r#"{"name":"a\"b\\c\u4e2d\td"}"#;
+        let s = match get(body, "name") {
+            Some(Value::Str(s)) => s,
+            _ => panic!("应取到字符串"),
+        };
+        assert_eq!(s, "a\"b\\c中\td");
+        assert_eq!(escape(&s), "a\\\"b\\\\c中\\td");
+    }
+
+    #[test]
+    fn get_rejects_non_numeric_token() {
+        // 带引号的是合法字符串值；光秃秃的非数字令牌才判非法
+        assert!(matches!(get(r#"{"total":"abc"}"#, "total"), Some(Value::Str(ref s)) if s == "abc"));
+        assert!(get(r#"{"total":abc}"#, "total").is_none());
+        assert!(get(r#"{"total":12x}"#, "total").is_none());
+        assert!(matches!(get(r#"{"total":42}"#, "total"), Some(Value::Num(n)) if n == 42.0));
+    }
 }

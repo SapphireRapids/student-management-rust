@@ -350,7 +350,8 @@ fn handle_api(stream: &mut TcpStream, ctx: &Ctx, req: &HttpRequest) {
                     return;
                 }
             };
-            if stuno.len() > 20 {
+            // 与控制台一致：上限按字符数，不按字节（中文名 3 字节/字）
+            if stuno.chars().count() > 20 {
                 send_json(stream, 400, "Bad Request", &err_json("学号过长（最多 20 个字符）"));
                 return;
             }
@@ -370,6 +371,10 @@ fn handle_api(stream: &mut TcpStream, ctx: &Ctx, req: &HttpRequest) {
                     return;
                 }
             };
+            if name.chars().count() > 40 {
+                send_json(stream, 400, "Bad Request", &err_json("姓名过长（最多 40 个字符）"));
+                return;
+            }
             if !valid_field(&name) {
                 send_json(stream, 400, "Bad Request", &err_json("姓名含非法字符"));
                 return;
@@ -438,6 +443,10 @@ fn handle_api(stream: &mut TcpStream, ctx: &Ctx, req: &HttpRequest) {
                     if json::get(body, "name").is_some() {
                         match parse_str_field(body, "name", "姓名") {
                             Ok(name) => {
+                                if name.chars().count() > 40 {
+                                    send_json(stream, 400, "Bad Request", &err_json("姓名过长（最多 40 个字符）"));
+                                    return;
+                                }
                                 if !valid_field(&name) {
                                     send_json(stream, 400, "Bad Request", &err_json("姓名含非法字符"));
                                     return;

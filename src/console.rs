@@ -27,12 +27,13 @@ fn read_line(prompt: &str) -> Option<String> {
 }
 
 /// 读总分；非数字/越界要求重输，不会死循环。
-fn read_total(prompt: &str, keep_old: Option<i32>) -> Option<i32> {
+/// None = EOF；Some(None) = 直接回车保持原值；Some(Some(v)) = 新输入的值。
+fn read_total(prompt: &str, allow_keep: bool) -> Option<Option<i32>> {
     loop {
         let line = read_line(prompt)?;
         if line.is_empty() {
-            if let Some(old) = keep_old {
-                return Some(old); // 直接回车 = 保持不变
+            if allow_keep {
+                return Some(None); // 直接回车 = 保持不变
             }
             println!("输入不能为空，请重新输入。");
             continue;
@@ -42,7 +43,7 @@ fn read_total(prompt: &str, keep_old: Option<i32>) -> Option<i32> {
             continue;
         }
         match line.parse::<i64>() {
-            Ok(v) if v >= TOTAL_MIN as i64 && v <= TOTAL_MAX as i64 => return Some(v as i32),
+            Ok(v) if v >= TOTAL_MIN as i64 && v <= TOTAL_MAX as i64 => return Some(Some(v as i32)),
             _ => println!("总分必须在 {}~{} 之间，请重新输入。", TOTAL_MIN, TOTAL_MAX),
         }
     }
@@ -89,7 +90,7 @@ fn op_add(store: &Mutex<Store>) {
             println!("学号不能为空，请重新输入。");
             continue;
         }
-        if stuno.len() > 20 {
+        if stuno.chars().count() > 20 {
             println!("学号过长（最多 20 个字符），请重新输入。");
             continue;
         }
@@ -110,15 +111,19 @@ fn op_add(store: &Mutex<Store>) {
             println!("姓名不能为空，请重新输入。");
             continue;
         }
+        if name.chars().count() > 40 {
+            println!("姓名过长（最多 40 个字符），请重新输入。");
+            continue;
+        }
         if !crate::store::valid_field(&name) {
             println!("姓名含非法字符，请重新输入。");
             continue;
         }
 
         let prompt = format!("请输入总分({}~{}): ", TOTAL_MIN, TOTAL_MAX);
-        let total = match read_total(&prompt, None) {
-            Some(t) => t,
-            None => return,
+        let total = match read_total(&prompt, false) {
+            Some(Some(t)) => t,
+            _ => return, // EOF（allow_keep=false 时不会出现 Some(None)）
         };
 
         let mut st = lock(store);
@@ -154,20 +159,19 @@ fn op_delete(store: &Mutex<Store>) {
         return;
     }
 
-    let idx = {
+    {
         let st = lock(store);
         match st.find(&stuno) {
             Some(i) => {
                 let s = &st.students[i];
                 println!("找到学生：{} {}（总分 {}）", s.name, s.stuno, s.total);
-                i
             }
             None => {
                 println!("未找到学号为 {} 的学生。", stuno);
                 return;
             }
         }
-    };
+    }
 
     let prompt = format!("确认删除学号 {} 的学生吗? (y/n): ", stuno);
     match read_yes_no(&prompt) {
@@ -179,10 +183,17 @@ fn op_delete(store: &Mutex<Store>) {
         None => return,
     }
 
+    // 等用户确认的这段时间里网页端可能增删过记录， Vec 下标会变。
+    // 不能沿用之前的下标（会删错人甚至越界 panic），重新按学号找，找到哪个删哪个。
     let mut st = lock(store);
-    st.students.remove(idx);
-    st.save();
-    println!("删除成功。");
+    match st.find(&stuno) {
+        Some(i) => {
+            st.students.remove(i);
+            st.save();
+            println!("删除成功。");
+        }
+        None => println!("学号 {} 刚被网页端删除，删除取消。", stuno),
+    }
 }
 
 fn op_modify(store: &Mutex<Store>) {
@@ -195,17 +206,18 @@ fn op_modify(store: &Mutex<Store>) {
         return;
     }
 
-    let idx = match lock(store).find(&stuno) {
-        Some(i) => i,
-        None => {
-            println!("未找到学号为 {} 的学生。", stuno);
-            return;
-        }
-    };
     {
         let st = lock(store);
-        let s = &st.students[idx];
-        println!("当前信息：学号 {}，姓名 {}，总分 {}", s.stuno, s.name, s.total);
+        match st.find(&stuno) {
+            Some(i) => {
+                let s = &st.students[i];
+                println!("当前信息：学号 {}，姓名 {}，总分 {}", s.stuno, s.name, s.total);
+            }
+            None => {
+                println!("未找到学号为 {} 的学生。", stuno);
+                return;
+            }
+        }
     }
     println!("（直接回车表示保持不变）");
 
@@ -213,28 +225,44 @@ fn op_modify(store: &Mutex<Store>) {
         Some(s) => s,
         None => return,
     };
-    if !new_name.is_empty() && !crate::store::valid_field(&new_name) {
-        println!("姓名含非法字符，修改失败。");
-        return;
+    if !new_name.is_empty() {
+        if new_name.chars().count() > 40 {
+            println!("姓名过长（最多 40 个字符），修改失败。");
+            return;
+        }
+        if !crate::store::valid_field(&new_name) {
+            println!("姓名含非法字符，修改失败。");
+            return;
+        }
     }
 
     let prompt = format!("新总分({}~{}): ", TOTAL_MIN, TOTAL_MAX);
-    let old_total = lock(store).students[idx].total;
-    let new_total = match read_total(&prompt, Some(old_total)) {
+    // Some(None) = 直接回车保持原值；保持原值的最终取值在写回时按学号现读，
+    // 避免把网页端这期间刚改过的总分又覆盖回旧值
+    let new_total = match read_total(&prompt, true) {
         Some(t) => t,
         None => return,
     };
 
+    // 读新姓名/新总分期间没有持锁，网页端可能已删掉这个学号或改变了 Vec 顺序，
+    // 下标全部作废——重新按学号找，找不到就取消，绝不按旧下标乱改
     let mut st = lock(store);
-    let s = &mut st.students[idx];
-    if !new_name.is_empty() {
-        s.name = new_name;
+    match st.find(&stuno) {
+        Some(i) => {
+            let s = &mut st.students[i];
+            if !new_name.is_empty() {
+                s.name = new_name;
+            }
+            if let Some(t) = new_total {
+                s.total = t;
+            }
+            let (name, stuno2, total) = (s.name.clone(), s.stuno.clone(), s.total);
+            st.save();
+            drop(st);
+            println!("修改成功：{} {}（总分 {}）。", name, stuno2, total);
+        }
+        None => println!("学号 {} 刚被网页端删除，修改已取消。", stuno),
     }
-    s.total = new_total;
-    let (name, stuno2, total) = (s.name.clone(), s.stuno.clone(), s.total);
-    st.save();
-    drop(st);
-    println!("修改成功：{} {}（总分 {}）。", name, stuno2, total);
 }
 
 fn op_search(store: &Mutex<Store>) {
