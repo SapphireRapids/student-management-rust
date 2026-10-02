@@ -4,3 +4,4 @@
 *.exp
 students.txt.tmp
 /target
+*.exe
